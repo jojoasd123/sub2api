@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+POLICY_DIR="${SUB2API_FAST_POLICY_DIR:-/home/ubuntu/apps/sub2api-fast-policy}"
+STATE_FILE="$POLICY_DIR/state.json"
+RUNTIME_FILE="$POLICY_DIR/runtime.json"
+LOCK_DIR="$POLICY_DIR/.lock"
+
+psql_sub2api() {
+  docker exec -i sub2api-postgres psql -U sub2api -d sub2api -v ON_ERROR_STOP=1 "$@"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sub2api-fastctl on <email>
+  sub2api-fastctl off <email>
+  sub2api-fastctl inherit <email>
+  sub2api-fastctl default on|off
+  sub2api-fastctl refresh
+  sub2api-fastctl list
+
+Notes:
+  - Controls fast by account email.
+  - Does not print API keys.
+  - Runtime policy stores token SHA-256 hashes, not plaintext tokens.
+EOF
+}
+
+with_lock() {
+  mkdir -p "$POLICY_DIR"
+  chmod 700 "$POLICY_DIR"
+  local tries=0
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 100 ]; then
+      echo "failed to acquire lock: $LOCK_DIR" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+}
+
+ensure_state() {
+  mkdir -p "$POLICY_DIR"
+  chmod 700 "$POLICY_DIR"
+  if [ ! -f "$STATE_FILE" ]; then
+    umask 077
+    python3 - "$STATE_FILE" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+data = {
+    "version": 1,
+    "defaultFast": False,
+    "userOverrides": {},
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+  fi
+}
+
+resolve_user_id() {
+  local email="$1"
+  local rows
+  rows="$(psql_sub2api -v "email=$email" -At <<'SQL'
+select id
+from users
+where lower(email)=lower(:'email') and deleted_at is null
+order by id;
+SQL
+)"
+  local count
+  count="$(printf '%s\n' "$rows" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$count" -eq 0 ]; then
+    echo "no active user found for that email" >&2
+    exit 1
+  fi
+  if [ "$count" -gt 1 ]; then
+    echo "multiple users found for that email; refusing ambiguous update" >&2
+    exit 1
+  fi
+  printf '%s\n' "$rows" | sed -n '1p'
+}
+
+set_user_override() {
+  local user_id="$1"
+  local mode="$2"
+  python3 - "$STATE_FILE" "$user_id" "$mode" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+path, user_id, mode = sys.argv[1:4]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data.setdefault("version", 1)
+data.setdefault("defaultFast", False)
+overrides = data.setdefault("userOverrides", {})
+if mode == "inherit":
+    overrides.pop(str(user_id), None)
+elif mode == "on":
+    overrides[str(user_id)] = True
+elif mode == "off":
+    overrides[str(user_id)] = False
+else:
+    raise SystemExit(f"unknown mode: {mode}")
+data["updatedAt"] = datetime.now(timezone.utc).isoformat()
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+}
+
+set_default() {
+  local value="$1"
+  python3 - "$STATE_FILE" "$value" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+path, value = sys.argv[1:3]
+if value not in {"on", "off"}:
+    raise SystemExit("default expects on or off")
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data["defaultFast"] = value == "on"
+data.setdefault("userOverrides", {})
+data["updatedAt"] = datetime.now(timezone.utc).isoformat()
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+}
+
+refresh_policy() {
+  local rows_file
+  rows_file="$(mktemp)"
+  trap 'rm -f "${rows_file:-}"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  psql_sub2api -F $'\t' -At >"$rows_file" <<'SQL'
+select u.id, u.email, coalesce(k.id, 0), coalesce(k.key, '')
+from users u
+left join api_keys k
+  on k.user_id=u.id
+ and k.deleted_at is null
+ and k.status='active'
+where u.deleted_at is null
+order by u.id, k.id;
+SQL
+  python3 - "$STATE_FILE" "$RUNTIME_FILE" "$rows_file" <<'PY'
+import collections
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+state_path, runtime_path, rows_path = sys.argv[1:4]
+with open(state_path, "r", encoding="utf-8") as f:
+    state = json.load(f)
+
+default_fast = state.get("defaultFast") is True
+overrides = {str(k): bool(v) for k, v in state.get("userOverrides", {}).items()}
+users = collections.OrderedDict()
+
+with open(rows_path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        user_id, email, key_id, key = line.split("\t", 3)
+        entry = users.setdefault(user_id, {
+            "userId": int(user_id),
+            "emailMask": email[:1] + "***" + email[email.find("@"):] if "@" in email else "***",
+            "override": overrides.get(user_id, None),
+            "activeKeyCount": 0,
+            "keyHashes": [],
+        })
+        if key_id != "0" and key:
+            entry["activeKeyCount"] += 1
+            entry["keyHashes"].append(hashlib.sha256(key.encode("utf-8")).hexdigest())
+
+fast_hashes = set()
+blocked_hashes = set()
+public_users = []
+for user_id, entry in users.items():
+    override = overrides.get(user_id, None)
+    if override is True:
+        fast_hashes.update(entry["keyHashes"])
+    elif override is False:
+        blocked_hashes.update(entry["keyHashes"])
+    public_users.append({
+        "userId": entry["userId"],
+        "emailMask": entry["emailMask"],
+        "override": override,
+        "activeKeyCount": entry["activeKeyCount"],
+    })
+
+runtime = {
+    "version": 1,
+    "defaultFast": default_fast,
+    "generatedAt": datetime.now(timezone.utc).isoformat(),
+    "fastKeyHashes": sorted(fast_hashes),
+    "blockedKeyHashes": sorted(blocked_hashes),
+    "users": public_users,
+}
+
+os.makedirs(os.path.dirname(runtime_path), exist_ok=True)
+tmp = runtime_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(runtime, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, runtime_path)
+os.chmod(runtime_path, 0o600)
+print(f"refreshed defaultFast={str(default_fast).lower()} fastKeys={len(fast_hashes)} blockedKeys={len(blocked_hashes)} users={len(public_users)}")
+PY
+  rm -f "$rows_file"
+}
+
+list_policy() {
+  python3 - "$STATE_FILE" "$RUNTIME_FILE" <<'PY'
+import json
+import os
+import sys
+
+state_path, runtime_path = sys.argv[1:3]
+with open(state_path, "r", encoding="utf-8") as f:
+    state = json.load(f)
+runtime = {}
+if os.path.exists(runtime_path):
+    with open(runtime_path, "r", encoding="utf-8") as f:
+        runtime = json.load(f)
+
+print(f"default_fast={'on' if state.get('defaultFast') else 'off'}")
+print(f"runtime_generated_at={runtime.get('generatedAt', '-')}")
+print("users:")
+for user in runtime.get("users", []):
+    override = user.get("override")
+    if override is True:
+        mode = "fast:on"
+    elif override is False:
+        mode = "fast:off"
+    else:
+        mode = "inherit"
+    print(f"  user_id={user['userId']} email={user['emailMask']} keys={user['activeKeyCount']} {mode}")
+print(f"runtime_fast_keys={len(runtime.get('fastKeyHashes', []))}")
+print(f"runtime_blocked_keys={len(runtime.get('blockedKeyHashes', []))}")
+PY
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    on|off|inherit)
+      if [ "$#" -ne 2 ]; then usage >&2; exit 2; fi
+      with_lock
+      ensure_state
+      local user_id
+      user_id="$(resolve_user_id "$2")"
+      set_user_override "$user_id" "$cmd"
+      refresh_policy
+      echo "user_id=$user_id fast=$cmd"
+      ;;
+    default)
+      if [ "$#" -ne 2 ]; then usage >&2; exit 2; fi
+      with_lock
+      ensure_state
+      set_default "$2"
+      refresh_policy
+      echo "default_fast=$2"
+      ;;
+    refresh)
+      if [ "$#" -ne 1 ]; then usage >&2; exit 2; fi
+      with_lock
+      ensure_state
+      refresh_policy
+      ;;
+    list)
+      if [ "$#" -ne 1 ]; then usage >&2; exit 2; fi
+      ensure_state
+      if [ ! -f "$RUNTIME_FILE" ]; then
+        with_lock
+        refresh_policy >/dev/null
+      fi
+      list_policy
+      ;;
+    -h|--help|help|"")
+      usage
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

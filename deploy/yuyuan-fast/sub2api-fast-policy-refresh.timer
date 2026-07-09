@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Sub2API account fast policy every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=sub2api-fast-policy-refresh.service
+
+[Install]
+WantedBy=timers.target

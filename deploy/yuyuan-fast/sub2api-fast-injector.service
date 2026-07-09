@@ -1,0 +1,22 @@
+[Unit]
+Description=Sub2API account-aware OpenAI priority service_tier injector
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apps/sub2api-fast-injector
+Environment=HOST=127.0.0.1
+Environment=PORT=18082
+Environment=UPSTREAM=http://127.0.0.1:18081
+Environment=MAX_BODY_BYTES=67108864
+Environment=FAST_POLICY_PATH=/home/ubuntu/apps/sub2api-fast-policy/runtime.json
+Environment=FAST_POLICY_RELOAD_MS=2000
+ExecStart=/usr/bin/node /home/ubuntu/apps/sub2api-fast-injector/server.mjs
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
