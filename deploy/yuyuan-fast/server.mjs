@@ -78,6 +78,10 @@ function shouldRewrite(req) {
   return contentType.toLowerCase().includes('application/json');
 }
 
+function requestPath(req) {
+  return new URL(req.url, 'http://127.0.0.1').pathname;
+}
+
 function copyHeaders(headers) {
   const out = { ...headers };
   delete out.host;
@@ -136,6 +140,29 @@ function forward(req, res, body) {
   }
 }
 
+function stripResponsesInputNamespaces(payload, path) {
+  if (path !== '/responses' && path !== '/v1/responses') return 0;
+  if (!payload || typeof payload !== 'object' || !('input' in payload)) return 0;
+
+  let removed = 0;
+  const visit = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+
+    if (Object.prototype.hasOwnProperty.call(value, 'namespace')) {
+      delete value.namespace;
+      removed += 1;
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+
+  visit(payload.input);
+  return removed;
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (!shouldRewrite(req)) {
@@ -153,10 +180,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    const path = requestPath(req);
     if (shouldUseFast(req)) {
       payload.service_tier = 'priority';
     } else {
       delete payload.service_tier;
+    }
+    const strippedNamespaces = stripResponsesInputNamespaces(payload, path);
+    if (strippedNamespaces > 0) {
+      console.warn(`stripped ${strippedNamespaces} unsupported responses input namespace field(s) path=${path}`);
     }
 
     const body = Buffer.from(JSON.stringify(payload));
