@@ -163,6 +163,10 @@ function stripResponsesInputNamespaces(payload, path) {
   return removed;
 }
 
+function modelDisablesFast(model) {
+  return typeof model === 'string' && /^gpt-6(?:$|[-.])/i.test(model.trim());
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (!shouldRewrite(req)) {
@@ -181,7 +185,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const path = requestPath(req);
-    if (shouldUseFast(req)) {
+    if (shouldUseFast(req) && !modelDisablesFast(payload.model)) {
       payload.service_tier = 'priority';
     } else {
       delete payload.service_tier;
